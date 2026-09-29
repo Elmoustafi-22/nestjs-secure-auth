@@ -1,0 +1,178 @@
+import {
+    ConflictException,
+    Injectable,
+    UnauthorizedException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
+import type { JwtSignOptions } from '@nestjs/jwt';
+import * as argon2 from 'argon2';
+import { UsersService, SafeUser } from '../users/users.service';
+import type { JwtPayload } from './types/jwt-payload.type';
+import type { RegisterDto } from './dto/register.dto';
+import type { LoginDto } from './dto/login.dto';
+import { RefreshTokenDto } from './dto/refresh-token.dto';
+
+export type AuthResult = {
+    user: SafeUser;
+    accessToken: string;
+    refreshToken: string;
+};
+
+@Injectable()
+export class AuthService {
+    constructor(
+        private readonly usersService: UsersService,
+        private readonly jwtService: JwtService,
+        private readonly configService: ConfigService,
+    ) { }
+
+    private normalizeEmail(email: string): string {
+        return email.trim().toLocaleLowerCase();
+    }
+
+    private generateAccessToken(payload: JwtPayload): Promise<string> {
+        return this.jwtService.signAsync(payload, {
+            secret: this.configService.getOrThrow<string>('ACCESS_TOKEN_SECRET'),
+            expiresIn: this.configService.getOrThrow<string>(
+                'ACCESS_TOKEN_EXPIRES_IN',
+            ) as JwtSignOptions['expiresIn'],
+        });
+    }
+
+    private generateRefreshToken(payload: JwtPayload): Promise<string> {
+        return this.jwtService.signAsync(payload, {
+            secret: this.configService.getOrThrow<string>('REFRESH_TOKEN_SECRET'),
+            expiresIn: this.configService.getOrThrow<string>(
+                'REFRESH_TOKEN_EXPIRES_IN',
+            ) as JwtSignOptions['expiresIn'],
+        });
+    }
+
+    private async issueTokens(payload: JwtPayload): Promise<{
+        accessToken: string;
+        refreshToken: string;
+    }> {
+        const [accessToken, refreshToken] = await Promise.all([
+            this.generateAccessToken(payload),
+            this.generateRefreshToken(payload),
+        ]);
+
+        return { accessToken, refreshToken };
+    }
+
+    async register(dto: RegisterDto): Promise<AuthResult> {
+        const email = this.normalizeEmail(dto.email);
+
+        const existingUser = await this.usersService.findByEmail(email);
+
+        if (existingUser) {
+            throw new ConflictException('An account with this email already exists');
+        }
+
+        const passwordHash = await argon2.hash(dto.password);
+
+        const user = await this.usersService.createWithPassword({
+            name: dto.name,
+            email,
+            passwordHash,
+        });
+
+        const payload: JwtPayload = { sub: user.id, email: user.email };
+        const { accessToken, refreshToken } = await this.issueTokens(payload);
+
+        const refreshTokenHash = await argon2.hash(refreshToken);
+        await this.usersService.updateRefreshTokenHash(user.id, refreshTokenHash);
+
+        return {
+            user: this.usersService.toSafeUser(user),
+            accessToken,
+            refreshToken,
+        };
+    }
+
+    async login(dto: LoginDto): Promise<AuthResult> {
+        const email = this.normalizeEmail(dto.email);
+
+        const user = await this.usersService.findByEmail(email)
+
+        if (!user || !user.passwordHash) {
+            throw new UnauthorizedException('Invalid email or password');
+        }
+
+        const isPasswordValid = await argon2.verify(user.passwordHash, dto.password)
+
+        if (!isPasswordValid) {
+            throw new UnauthorizedException('Invalid email or password')
+        }
+
+        const payload: JwtPayload = { sub: user.id, email: user.email }
+        const { accessToken, refreshToken } = await this.issueTokens(payload)
+
+        const refreshTokenHash = await argon2.hash(refreshToken);
+        await this.usersService.updateRefreshTokenHash(user.id, refreshTokenHash);
+
+        return {
+            user: this.usersService.toSafeUser(user),
+            accessToken,
+            refreshToken
+        }
+    }
+
+    async refresh(dto: RefreshTokenDto): Promise<AuthResult> {
+        let payload: JwtPayload;
+
+        try {
+            payload = await this.jwtService.verifyAsync<JwtPayload>(
+                dto.refreshToken,
+                {
+                    secret: this.configService.getOrThrow<string>('REFRESH_TOKEN_SECRET')
+                })
+        } catch {
+            throw new UnauthorizedException('Invalid or expired refresh token')
+        }
+
+        const user = await this.usersService.findById(payload.sub);
+
+        if (!user || !user.refreshTokenHash) {
+            throw new UnauthorizedException('Invalid or expired refresh')
+        }
+
+        const isRefreshTokenValid = await argon2.verify(
+            user.refreshTokenHash,
+            dto.refreshToken
+        )
+
+        if (!isRefreshTokenValid) {
+            throw new UnauthorizedException('Invalid or expired refresh token')
+        }
+
+        const newPayload: JwtPayload = { sub: user.id, email: user.email };
+        const { refreshToken, accessToken } = await this.issueTokens(newPayload);
+
+        const refreshTokenHash = await argon2.hash(refreshToken)
+
+        await this.usersService.updateRefreshTokenHash(user.id, refreshTokenHash);
+
+        return {
+            user: this.usersService.toSafeUser(user),
+            accessToken,
+            refreshToken
+        }
+
+    }
+
+    async logout(userId: string): Promise<{ success: true }> {
+        await this.usersService.clearRefreshToken(userId)
+        return { success: true };
+    }
+
+    async getProfile(userId: string): Promise<SafeUser> {
+        const user = await this.usersService.findById(userId);
+        if (!user) {
+            throw new UnauthorizedException('User not found!')
+        }
+
+        return this.usersService.toSafeUser(user);
+    }
+}
