@@ -13,10 +13,15 @@
 ## 🔒 Security Highlights
 
 - **Argon2 Hashing**: Uses modern, memory-hard Argon2id algorithm for password hashing, mitigating GPU cracking and rainbow table attacks.
+- **Google OAuth 2.0 Integration**:
+  - Secure authorization code flow with anti-CSRF state token verification via short-lived HttpOnly cookies (`google_oauth_state`).
+  - Automatic account provisioning and existing account linking by verified email.
+  - Safe OAuth user model supporting passwordless accounts (`password_hash` nullable).
 - **Dual-Token JWT Strategy**:
   - **Access Token**: Short-lived (15 minutes by default) Bearer token for authenticating protected routes.
   - **Refresh Token**: Long-lived (7 days by default) token for obtaining fresh token pairs without re-authenticating.
 - **Hashed Refresh Tokens in Database**: Refresh tokens are never stored in plaintext in the database. Instead, they are hashed with Argon2 before persistence, preventing session hijacking even in the event of a database compromise.
+- **HttpOnly Cookie Delivery**: Sets `access_token` and `refresh_token` as secure, Lax, HttpOnly cookies upon successful OAuth authentication.
 - **Secure Revocation & Logout**: Logging out immediately invalidates the stored refresh token hash in PostgreSQL.
 - **Data Sanitization (`SafeUser`)**: Password hashes, refresh token hashes, and password reset tokens are strictly stripped out of API responses before reaching the client.
 - **Global Validation Pipeline**: Strict input validation using `class-validator` and `class-transformer` with `whitelist: true` and `forbidNonWhitelisted: true`.
@@ -30,6 +35,7 @@
 | :--- | :--- |
 | **[NestJS 11](https://nestjs.com/)** | Progressive Node.js framework with modular architecture |
 | **[TypeScript 5](https://www.typescriptlang.org/)** | Type safety and enhanced developer experience |
+| **[Google OAuth 2.0](https://developers.google.com/identity/protocols/oauth2)** | Social login, identity verification, and profile synchronization |
 | **[Drizzle ORM](https://orm.drizzle.team/)** | High-performance, lightweight TypeScript ORM |
 | **[PostgreSQL / Neon](https://neon.tech/)** | Relational database (compatible with serverless / standard Postgres) |
 | **[Argon2](https://github.com/ranisalt/node-argon2)** | Industry-standard cryptographic password and token hashing |
@@ -51,7 +57,8 @@ nest-auth/
 │   │   ├── types/               # JWT payload and request interfaces
 │   │   ├── auth.controller.ts   # Route definitions for /auth endpoints
 │   │   ├── auth.module.ts       # Module declaration & JWT configuration
-│   │   └── auth.service.ts      # Authentication business logic & token lifecycle
+│   │   ├── auth.service.ts      # Authentication business logic & token lifecycle
+│   │   └── google-auth.service.ts # Google OAuth code exchange & profile fetching
 │   ├── database/                # Database layer
 │   │   ├── database.module.ts   # Database provider module
 │   │   ├── database.provider.ts # PostgreSQL connection pool & Drizzle client
@@ -76,12 +83,15 @@ Create a `.env` file in the root of `nest-auth` (refer to `.env.example`):
 | :--- | :--- | :--- |
 | `PORT` | Application server port | `3000` |
 | `NODE_ENV` | Runtime environment | `development` |
-| `FRONTEND_URL` | Allowed CORS origin | `http://localhost:3001` |
+| `FRONTEND_URL` | Allowed CORS origin and OAuth redirect target | `http://localhost:3001` |
 | `DATABASE_URL` | PostgreSQL connection string | `postgresql://user:pass@host/db?sslmode=require` |
 | `ACCESS_TOKEN_SECRET` | Secret key used to sign access tokens | `your_access_token_secret` |
 | `ACCESS_TOKEN_EXPIRES_IN` | Access token lifespan | `15m` |
 | `REFRESH_TOKEN_SECRET` | Secret key used to sign refresh tokens | `your_refresh_token_secret` |
 | `REFRESH_TOKEN_EXPIRES_IN` | Refresh token lifespan | `7d` |
+| `GOOGLE_CLIENT_ID` | Google Cloud Console OAuth 2.0 Client ID | `your_client_id.apps.googleusercontent.com` |
+| `GOOGLE_CLIENT_SECRET` | Google Cloud Console OAuth 2.0 Client Secret | `your_client_secret` |
+| `GOOGLE_CALLBACK_URL` | Google OAuth redirect callback URI | `http://localhost:3000/auth/google/callback` |
 | `RESEND_API_KEY` | Resend API key for transactional emails | `re_xxxxxxxxxxxx` |
 | `EMAIL_FROM` | Sender address for system emails | `Auth Trial <onboarding@resend.dev>` |
 | `PASSWORD_RESET_URL` | Frontend URL for password reset links | `http://localhost:3001/reset-password` |
@@ -94,6 +104,7 @@ Create a `.env` file in the root of `nest-auth` (refer to `.env.example`):
 - **Node.js** (v18.x or v20.x+ recommended)
 - **npm** (or `pnpm` / `yarn`)
 - **PostgreSQL Database** (local instance or hosted provider like [Neon](https://neon.tech))
+- **Google Cloud Console Project** with OAuth 2.0 Web Client credentials enabled
 
 ### 2. Installation
 ```bash
@@ -104,19 +115,22 @@ npm install
 ### 3. Configure Environment
 ```bash
 cp .env.example .env
-# Edit .env with your PostgreSQL credentials and JWT secrets
+# Edit .env with your PostgreSQL credentials, JWT secrets, and Google OAuth credentials
 ```
 
+> **Google OAuth Setup Note**:
+> In the [Google Cloud Console](https://console.cloud.google.com/apis/credentials), under **Authorized redirect URIs**, add your exact callback URL:
+> `http://localhost:3000/auth/google/callback`
+
 ### 4. Database Setup & Migrations
-Manage database schema using Drizzle Kit:
+Manage database schema using npm scripts configured with Drizzle Kit:
 
 ```bash
-# Push schema directly to database
-npx drizzle-kit push
+# Generate SQL migrations from schema
+npm run db:generate
 
-# OR generate and run SQL migrations
-npx drizzle-kit generate
-npx drizzle-kit migrate
+# Apply pending migrations to PostgreSQL database
+npm run db:migrate
 
 # Open Drizzle Studio web GUI
 npx drizzle-kit studio
@@ -160,6 +174,8 @@ Creates a new account and returns the user profile with access and refresh token
     "id": "7f13b1f5-e214-4113-911a-3e819b2241cf",
     "name": "Jane Doe",
     "email": "jane@example.com",
+    "googleId": null,
+    "githubId": null,
     "avatarUrl": null,
     "createdAt": "2026-09-29T14:30:00.000Z",
     "updatedAt": "2026-09-29T14:30:00.000Z"
@@ -190,6 +206,8 @@ Authenticates an existing user via email and password.
     "id": "7f13b1f5-e214-4113-911a-3e819b2241cf",
     "name": "Jane Doe",
     "email": "jane@example.com",
+    "googleId": null,
+    "githubId": null,
     "avatarUrl": null,
     "createdAt": "2026-09-29T14:30:00.000Z",
     "updatedAt": "2026-09-29T14:30:00.000Z"
@@ -201,7 +219,46 @@ Authenticates an existing user via email and password.
 
 ---
 
-### 3. Refresh Access Token
+### 3. Initiate Google OAuth Flow
+Generates a cryptographically random `state` parameter, stores it in a secure HttpOnly cookie (`google_oauth_state`), and redirects the client to the Google OAuth consent screen.
+
+- **URL**: `GET /auth/google`
+- **Auth Required**: No
+- **Flow**:
+  1. Sets cookie: `google_oauth_state` (HttpOnly, Lax, 15 min TTL).
+  2. Redirects (`302`) to:
+     ```text
+     https://accounts.google.com/o/oauth2/v2/auth?client_id=...&redirect_uri=http://localhost:3000/auth/google/callback&response_type=code&scope=openid+email+profile&state=...
+     ```
+
+---
+
+### 4. Google OAuth Callback
+Receives the authorization code and state from Google, verifies the state against the cookie, exchanges the code for an access token, retrieves the user profile, provisions/links the account, and issues authentication cookies.
+
+- **URL**: `GET /auth/google/callback`
+- **Auth Required**: No
+- **Query Parameters**:
+  - `code`: Authorization code returned by Google.
+  - `state`: State parameter returned by Google.
+- **Workflow**:
+  1. Validates `state` against `google_oauth_state` cookie (protects against CSRF).
+  2. Clears the `google_oauth_state` cookie.
+  3. Exchanges `code` for Google access token via Google OAuth 2.0 Token API.
+  4. Fetches user profile (`email`, `name`, `sub`/`googleId`, `picture`) from Google UserInfo endpoint.
+  5. Finds or creates user record in PostgreSQL (links `googleId` if account with email exists, or creates new OAuth user).
+  6. Issues JWT `accessToken` and `refreshToken`, storing the hashed refresh token in the database.
+  7. Sets `access_token` and `refresh_token` as HttpOnly cookies on the response:
+     - `access_token` (15 min TTL)
+     - `refresh_token` (7 days TTL)
+  8. Redirects:
+     - **Success**: `${FRONTEND_URL}/auth/callback`
+     - **Invalid State**: `${FRONTEND_URL}/auth/callback?error=invalid_oauth_state`
+     - **Failure**: `${FRONTEND_URL}/auth/callback?error=google_auth_failed`
+
+---
+
+### 5. Refresh Access Token
 Exchanges a valid refresh token for a newly rotated access token and refresh token pair.
 
 - **URL**: `POST /auth/refresh`
@@ -219,6 +276,8 @@ Exchanges a valid refresh token for a newly rotated access token and refresh tok
     "id": "7f13b1f5-e214-4113-911a-3e819b2241cf",
     "name": "Jane Doe",
     "email": "jane@example.com",
+    "googleId": null,
+    "githubId": null,
     "avatarUrl": null,
     "createdAt": "2026-09-29T14:30:00.000Z",
     "updatedAt": "2026-09-29T14:30:00.000Z"
@@ -230,7 +289,7 @@ Exchanges a valid refresh token for a newly rotated access token and refresh tok
 
 ---
 
-### 4. Logout
+### 6. Logout
 Revokes the authenticated user's refresh token by clearing the stored hash in the database.
 
 - **URL**: `POST /auth/logout`
@@ -248,7 +307,7 @@ Revokes the authenticated user's refresh token by clearing the stored hash in th
 
 ---
 
-### 5. Get Current User Profile
+### 7. Get Current User Profile
 Retrieves sanitized profile details for the authenticated user.
 
 - **URL**: `GET /auth/me`
@@ -263,7 +322,9 @@ Retrieves sanitized profile details for the authenticated user.
   "id": "7f13b1f5-e214-4113-911a-3e819b2241cf",
   "name": "Jane Doe",
   "email": "jane@example.com",
-  "avatarUrl": null,
+  "googleId": "101191662488808516242",
+  "githubId": null,
+  "avatarUrl": "https://lh3.googleusercontent.com/...",
   "createdAt": "2026-09-29T14:30:00.000Z",
   "updatedAt": "2026-09-29T14:30:00.000Z"
 }
@@ -292,12 +353,15 @@ npm run test:cov
 - [x] Argon2 password & refresh token hashing
 - [x] Token invalidation / logout mechanism
 - [x] Drizzle ORM schema with PostgreSQL
+- [x] Google OAuth 2.0 integration (code flow, state verification, cookie auth)
+- [x] Dynamic account linking (Email matching + Google ID persistence)
+- [ ] GitHub OAuth 2.0 integration
 - [ ] Forgot Password & Reset Password email workflow via Resend
 - [ ] Rate limiting & brute-force protection (`@nestjs/throttler`)
-- [ ] Optional HttpOnly cookie support for Web Single Page Applications (SPA)
 
 ---
 
 ## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
+
